@@ -1,0 +1,1121 @@
+---
+title: "R Final Longevity"
+output: html_document
+date: "2024-11-30"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# 1.---- DATA PREPARATION & CLEANING ----
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(caret)
+library(MASS)
+library(rpart)
+library(randomForest)
+library(gbm)
+library(cluster)
+library(factoextra)
+library(survival)
+library(skimr)
+library(ggplot2)
+library(viridis)
+library(plotly)
+library(scales)
+
+# Read data
+olympic_data <- read.csv("/Users/wangxinyi/Desktop/athlete.csv")
+```
+
+```{r}
+head(olympic_data)
+```
+
+```{r}
+# Analyze sports continuity with minimum 20 years existence
+established_sports <- olympic_data %>%
+  group_by(Sport) %>%
+  summarise(
+    first_year = min(Year),
+    last_year = max(Year),
+    total_years = n_distinct(Year),
+    years_span = last_year - first_year + 1,
+    is_current = max(Year) >= 2000,
+    years_in_21st = sum(Year >= 2000),
+    total_athletes = n_distinct(ID),
+    continuity_ratio = total_years / years_span  # Measure of consistency
+  ) %>%
+  filter(
+    is_current == TRUE,
+    years_span >= 20
+  ) %>%
+  arrange(desc(total_years))
+
+# Create visualization
+p1 <- ggplot(established_sports, 
+       aes(x = first_year, xend = last_year, 
+           y = reorder(Sport, total_years), yend = Sport)) +
+  geom_segment(aes(color = continuity_ratio, size = total_athletes)) +
+  scale_color_viridis(option = "plasma") +
+  geom_vline(xintercept = 2000, linetype = "dashed", color = "red", alpha = 0.5) +
+  labs(
+    title = "Well-Established Olympic Sports Timeline",
+    subtitle = paste("Total Sports:", 
+                    nrow(established_sports)),
+    x = "Year",
+    y = "Sport",
+    color = "Continuity Ratio",
+    size = "Total Athletes"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 8)
+  )
+
+# Create summary table
+summary_table <- established_sports %>%
+  select(
+    Sport,
+    first_year,
+    last_year,
+    total_years,
+    years_in_21st,
+    total_athletes,
+    continuity_ratio
+  ) %>%
+  arrange(desc(total_years))
+
+# Print summary statistics
+print("Summary of Well-Established Olympic Sports:")
+print(summary_table)
+
+# Calculate stability metrics
+stability_metrics <- established_sports %>%
+  mutate(
+    stability_score = (continuity_ratio * 0.4) + 
+                     (total_years/max(total_years) * 0.3) + 
+                     (total_athletes/max(total_athletes) * 0.3)
+  ) %>%
+  arrange(desc(stability_score))
+
+# Create stability score visualization
+p2 <- ggplot(stability_metrics, 
+       aes(x = reorder(Sport, stability_score), y = stability_score)) +
+  geom_bar(stat = "identity", aes(fill = continuity_ratio)) +
+  scale_fill_viridis() +
+  coord_flip() +
+  labs(
+    title = "Sport Stability Scores",
+    subtitle = "Based on continuity, longevity, and participation",
+    x = "Sport",
+    y = "Stability Score",
+    fill = "Continuity Ratio"
+  ) +
+  theme_minimal()
+
+# Display plots
+print(p1)
+print(p2)
+
+```
+
+# Selected 44 sports
+
+```{r}
+# First identify the 44 established sports
+established_sports <- olympic_data %>%
+  group_by(Sport) %>%
+  summarise(
+    first_year = min(Year),
+    last_year = max(Year),
+    total_years = n_distinct(Year),
+    years_span = last_year - first_year + 1,
+    is_current = max(Year) >= 2000
+  ) %>%
+  filter(
+    is_current == TRUE,
+    years_span >= 20
+  ) %>%
+  pull(Sport)
+
+# Create filtered dataset
+olympic_established <- olympic_data %>% filter(Sport %in% established_sports)
+
+# Verify the filtering
+sport_count <- length(unique(olympic_established$Sport))
+print(paste("Number of sports in filtered dataset:", sport_count))
+
+# Quick summary of the filtered dataset
+summary_stats <- olympic_established %>%
+  summarise(
+    total_records = n(),
+    unique_athletes = n_distinct(ID),
+    year_range = paste(min(Year), "-", max(Year)),
+    total_countries = n_distinct(NOC)
+  )
+
+print("Summary of filtered dataset:")
+print(summary_stats)
+```
+
+# Missing Values
+
+```{r}
+# 1. Basic missing value summary
+missing_summary <- sapply(olympic_established, function(x) sum(is.na(x)))
+missing_percent <- round(100 * missing_summary / nrow(olympic_data), 2)
+
+# Create summary dataframe
+missing_stats <- data.frame(
+  n_missing = missing_summary,
+  percent_missing = missing_percent
+) %>%
+  arrange(desc(percent_missing))
+
+print("Missing value summary:")
+print(missing_stats)
+```
+
+
+```{r}
+# Create analysis of missing values by year
+missing_by_year <- olympic_established %>%
+  group_by(Year) %>%
+  summarise(
+    total_records = n(),
+    missing_age = sum(is.na(Age))/n()*100,
+    missing_height = sum(is.na(Height))/n()*100,
+    missing_weight = sum(is.na(Weight))/n()*100,
+    missing_medal = sum(is.na(Medal))/n()*100
+  )
+
+# Print summary
+print("Summary of missing values by year:")
+print(missing_by_year)
+
+# Create long format for visualization
+missing_by_year_long <- missing_by_year %>%
+  pivot_longer(
+    cols = starts_with("missing"),
+    names_to = "variable",
+    values_to = "percent_missing"
+  ) %>%
+  mutate(variable = gsub("missing_", "", variable))
+
+# Create visualization
+ggplot(missing_by_year_long, aes(x = Year, y = percent_missing, color = variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(
+    title = "Percentage of Missing Values by Year",
+    x = "Year",
+    y = "Percentage Missing (%)",
+    color = "Variable"
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# Create a heatmap of missing values
+missing_heatmap_data <- olympic_data %>%
+  group_by(Year, Sport) %>%
+  summarise(
+    missing_age_pct = sum(is.na(Age))/n()*100,
+    .groups = 'drop'
+  ) %>%
+  filter(n() >= 10)  # Filter sports with at least 10 participants
+
+ggplot(missing_heatmap_data, aes(x = Year, y = Sport, fill = missing_age_pct)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "red") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    title = "Heatmap of Missing Age Values by Sport and Year",
+    x = "Year",
+    y = "Sport",
+    fill = "% Missing"
+  )
+```
+
+
+```{r}
+# Approach to fill missing values considering temporal patterns
+# 1. First split data into historical (pre-1960) and modern (1960 onwards) periods
+# 2. Use different strategies for each period
+
+# Create function to fill missing values
+olympic_data_filled <- olympic_established %>%
+  # Create period indicator
+  mutate(period = ifelse(Year >= 1960, "modern", "historical")) %>%
+  
+  # Fill Age - using median by Sport and Sex within each period
+  group_by(period, Sport, Sex) %>%
+  mutate(Age = ifelse(is.na(Age), 
+                      median(Age, na.rm = TRUE), 
+                      Age)) %>%
+  # If still NA, use overall period median
+  group_by(period) %>%
+  mutate(Age = ifelse(is.na(Age), 
+                      median(Age, na.rm = TRUE), 
+                      Age)) %>%
+  
+  # Fill Height and Weight - similar approach
+  group_by(period, Sport, Sex) %>%
+  mutate(
+    Height = ifelse(is.na(Height), 
+                   median(Height, na.rm = TRUE), 
+                   Height),
+    Weight = ifelse(is.na(Weight), 
+                   median(Weight, na.rm = TRUE), 
+                   Weight)
+  ) %>%
+  # If still NA, use overall period medians
+  group_by(period) %>%
+  mutate(
+    Height = ifelse(is.na(Height), 
+                   median(Height, na.rm = TRUE), 
+                   Height),
+    Weight = ifelse(is.na(Weight), 
+                   median(Weight, na.rm = TRUE), 
+                   Weight)
+  ) %>%
+  
+  # Fill Medal - convert NA to "No Medal"
+  mutate(Medal = ifelse(is.na(Medal), "No Medal", Medal)) %>%
+  
+  # Remove grouping
+  ungroup() %>%
+  
+  # Create flags for imputed values (for transparency)
+  mutate(
+    age_imputed = is.na(olympic_established$Age),
+    height_imputed = is.na(olympic_established$Height),
+    weight_imputed = is.na(olympic_established$Weight)
+  )
+
+# Check results
+summary_after <- olympic_data_filled %>%
+  group_by(period) %>%
+  summarise(
+    n = n(),
+    age_missing = sum(is.na(Age)),
+    height_missing = sum(is.na(Height)),
+    weight_missing = sum(is.na(Weight))
+  )
+
+print("Summary after filling missing values:")
+print(summary_after)
+
+# Verify imputation by comparing distributions
+# For modern period
+modern_dist <- olympic_data_filled %>%
+  filter(period == "modern") %>%
+  summarise(
+    age_mean = mean(Age),
+    age_sd = sd(Age),
+    height_mean = mean(Height),
+    height_sd = sd(Height),
+    weight_mean = mean(Weight),
+    weight_sd = sd(Weight)
+  )
+
+print("\nDistribution summary for modern period:")
+print(modern_dist)
+```
+
+# 2. ---- EDA ----
+
+# Overall Career Length Distribution
+
+```{r}
+# 1. Career Length Analysis ----
+career_metrics <- olympic_data_filled %>%
+  group_by(ID) %>%
+  summarise(
+    career_length = max(Year) - min(Year),
+    participations = n_distinct(Games),
+    main_sport = names(which.max(table(Sport))),
+    avg_age = mean(Age),
+    last_height = last(Height),
+    last_weight = last(Weight),
+    medals = sum(!is.na(Medal)),
+    country = first(NOC)
+  )
+
+# Enhanced Career Length Distribution
+ggplot(career_metrics, aes(x = career_length)) +
+  geom_histogram(aes(y = ..density..), bins = 30, 
+                 fill = "#3498db", color = "white", alpha = 0.7) +
+  geom_density(color = "#e74c3c", size = 1) +
+  labs(
+    title = "Distribution of Olympic Career Lengths",
+    subtitle = "Analysis of Athletes' Competitive Longevity (1896-2016)",
+    x = "Career Length (Years)",
+    y = "Density",
+    caption = "n = 271,116 athletes"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(size = 10),
+    plot.caption = element_text(size = 8, hjust = 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, max(career_metrics$career_length), by = 4))
+```
+
+# Career Length by Sport
+
+```{r}
+# 2. Sport Longevity Analysis ----
+sport_longevity <- career_metrics %>%
+  group_by(main_sport) %>%
+  summarise(
+    avg_career = mean(career_length, na.rm = TRUE),
+    median_career = median(career_length, na.rm = TRUE),
+    athlete_count = n(),
+    avg_participations = mean(participations, na.rm = TRUE),
+    medal_rate = sum(medals > 0) / n()
+  ) %>%
+  filter(athlete_count >= 30) %>%  # Filter for sports with sufficient data
+  arrange(desc(avg_career))
+
+# Top Sports by Career Length
+top_sports <- ggplot(head(sport_longevity, 30), 
+       aes(x = reorder(main_sport, avg_career), y = avg_career)) +
+  geom_bar(stat = "identity", aes(fill = athlete_count)) +
+  scale_fill_viridis() +
+  coord_flip() +
+  labs(
+    title = "Average Career Length by Sport",
+    x = "Sport",
+    y = "Average Career Length (Years)",
+    fill = "Number of Athletes"
+  ) +
+  theme_minimal()
+
+top_sports
+```
+
+# Age
+
+```{r}
+# Create career path metrics with focus on age
+
+career_path_metrics <- olympic_data_filled %>%
+  group_by(ID) %>%
+  summarise(
+    career_length = max(Year) - min(Year),
+    participations = n_distinct(Games),
+    first_age = first(Age),
+    main_sport = names(which.max(table(Sport))),
+    first_year = min(Year),
+    early_medals = sum(Medal != "No Medal" & (Year - min(Year) <= 4)),
+    total_medals = sum(Medal != "No Medal"),
+    gender = first(Sex)
+  ) %>%
+  mutate(
+    age_category = case_when(
+      first_age < quantile(first_age, 0.25) ~ "Very Young",
+      first_age < median(first_age) ~ "Young",
+      first_age < quantile(first_age, 0.75) ~ "Mature",
+      TRUE ~ "Late Start"
+    ),
+    early_success = ifelse(early_medals > 0, "Early Success", "No Early Success"),
+    career_category = case_when(
+      career_length == 0 ~ "Single Games",
+      career_length <= 4 ~ "Short Career",
+      career_length <= 8 ~ "Medium Career",
+      TRUE ~ "Long Career"
+    )
+  )
+
+# 1. Age Impact Analysis
+p1 <- ggplot(career_path_metrics, aes(x = first_age, y = career_length)) +
+  geom_hex(bins = 30) +
+  scale_fill_viridis() +
+  geom_smooth(color = "red", method = "loess") +
+  labs(
+    title = "Relationship Between Starting Age and Career Length",
+    x = "Age at First Olympics",
+    y = "Career Length (Years)",
+    fill = "Number of Athletes"
+  ) +
+  theme_minimal()
+
+# 2. Age Category and Early Success Interaction
+age_success_interaction <- career_path_metrics %>%
+  group_by(age_category, early_success) %>%
+  summarise(
+    mean_career = mean(career_length),
+    n_athletes = n(),
+    se_career = sd(career_length) / sqrt(n())
+  )
+
+p2 <- ggplot(age_success_interaction, 
+       aes(x = age_category, y = mean_career, fill = early_success)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymin = mean_career - se_career, 
+                    ymax = mean_career + se_career),
+                position = position_dodge(width = 0.9),
+                width = 0.25) +
+  labs(
+    title = "Average Career Length by Age Category and Early Success",
+    x = "Age Category",
+    y = "Average Career Length (Years)",
+    fill = "Early Success Status"
+  ) +
+  theme_minimal()
+
+
+# Display plots
+print(p1)
+print(p2)
+```
+
+# Gender
+
+```{r}
+# Create base career metrics by gender
+gender_career_metrics <- olympic_data_filled %>%
+  group_by(ID) %>%
+  summarise(
+    career_length = max(Year) - min(Year),
+    participations = n_distinct(Games),
+    first_age = first(Age),
+    last_age = last(Age),
+    gender = first(Sex),
+    main_sport = names(which.max(table(Sport))),
+    medals_won = sum(Medal != "No Medal"),
+    first_year = min(Year)
+  )
+
+
+# Historical trend of career lengths by gender
+historical_trend <- gender_career_metrics %>%
+  group_by(first_year, gender) %>%
+  summarise(
+    mean_career = mean(career_length),
+    n_athletes = n()
+  ) %>%
+  filter(n_athletes >= 30)  # Filter for reliable sample sizes
+
+p1 <- ggplot(historical_trend, aes(x = first_year, y = mean_career, color = gender)) +
+  geom_line(size = 1) +
+  geom_point(aes(size = n_athletes), alpha = 0.6) +
+  scale_color_manual(values = c("#FF69B4", "#4169E1")) +
+  labs(
+    title = "Average Career Length Over Time by Gender",
+    x = "Starting Year",
+    y = "Average Career Length (Years)",
+    color = "Gender",
+    size = "Number of Athletes"
+  ) +
+  theme_minimal()
+
+
+# Display plots
+print(p1)
+
+# Statistical summary
+gender_summary <- gender_career_metrics %>%
+  group_by(gender) %>%
+  summarise(
+    mean_career = mean(career_length),
+    median_career = median(career_length),
+    sd_career = sd(career_length),
+    mean_participations = mean(participations),
+    mean_first_age = mean(first_age),
+    mean_medals = mean(medals_won),
+    total_athletes = n()
+  )
+
+print("Gender Career Statistics Summary:")
+print(gender_summary)
+```
+
+# BMI
+
+```{r}
+# Calculate BMI and career metrics
+bmi_career <- olympic_established %>%
+  # Calculate BMI
+  mutate(BMI = Weight / ((Height/100)^2)) %>%
+  # Filter out unrealistic BMI values
+  filter(BMI >= 15 & BMI <= 40) %>%
+  group_by(ID) %>%
+  summarise(
+    career_length = max(Year) - min(Year),
+    avg_bmi = mean(BMI, na.rm = TRUE),
+    first_bmi = first(BMI),
+    bmi_change = last(BMI) - first(BMI),
+    main_sport = names(which.max(table(Sport))),
+    gender = first(Sex),
+    medals = sum(!is.na(Medal)),
+    .groups = 'drop'
+  )
+
+# BMI distribution by Sport (Top 15 sports)
+top_sports <- bmi_career %>%
+  group_by(main_sport) %>%
+  summarise(n = n()) %>%
+  top_n(15, n) %>%
+  pull(main_sport)
+
+bmi_sports <- bmi_career %>%
+  filter(main_sport %in% top_sports) %>%
+  ggplot(aes(x = reorder(main_sport, avg_bmi), y = avg_bmi)) +
+  geom_boxplot(aes(fill = main_sport)) +
+  coord_flip() +
+  scale_fill_viridis_d() +
+  labs(
+    title = "BMI Distribution by Sport",
+    x = "Sport",
+    y = "BMI"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+bmi_sports
+
+# Sport-specific BMI vs Career Length
+bmi_length <- bmi_career %>%
+  filter(main_sport %in% top_sports) %>%
+  group_by(main_sport) %>%
+  summarise(
+    avg_career = mean(career_length, na.rm = TRUE),
+    avg_bmi = mean(avg_bmi, na.rm = TRUE),
+    n_athletes = n()
+  ) %>%
+  ggplot(aes(x = avg_bmi, y = avg_career)) +
+  geom_point(aes(size = n_athletes, color = main_sport)) +
+  geom_text(aes(label = main_sport), vjust = -0.5, size = 3) +
+  scale_size_continuous(range = c(3, 10)) +
+  labs(
+    title = "Average Career Length vs BMI by Sport",
+    x = "Average BMI",
+    y = "Average Career Length (Years)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+bmi_length
+```
+
+# Medal
+
+```{r}
+# Create medal impact visualization
+medal_impact <- olympic_data_filled %>%
+  group_by(ID) %>%
+  summarise(
+    career_length = max(Year) - min(Year),
+    has_medal = if(sum(Medal != "No Medal" & !is.na(Medal)) > 0) "With Medal" else "No Medal"
+  ) %>%
+  ungroup()
+
+# Create the plot
+ggplot(medal_impact, aes(x = has_medal, y = career_length, fill = has_medal)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("#3498db", "#e74c3c")) +  # Blue for No Medal, Red for With Medal
+  theme_minimal() +
+  labs(
+    title = "Career Length by Medal Success",
+    x = "Medal Status",
+    y = "Career Length (Years)",
+    fill = "Medal Status"
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 12)
+  )
+
+# Print summary statistics
+medal_stats <- medal_impact %>%
+  group_by(has_medal) %>%
+  summarise(
+    mean_length = mean(career_length),
+    median_length = median(career_length),
+    sd_length = sd(career_length),
+    n = n()
+  )
+
+print("Career Length Statistics by Medal Status:")
+print(medal_stats)
+```
+# Country Strength
+
+```{r}
+# Calculate country strength metrics
+country_strength <- olympic_data_filled %>%
+  group_by(NOC) %>%
+  summarise(
+    total_athletes = n_distinct(ID),
+    total_medals = sum(Medal != "No Medal"),
+    gold_medals = sum(Medal == "Gold"),
+    medal_per_athlete = total_medals / total_athletes,
+    athletes_with_medals = n_distinct(ID[Medal != "No Medal"]),
+    medal_success_rate = athletes_with_medals / total_athletes
+  ) %>%
+  filter(total_athletes >= 100) %>%  # Filter for countries with significant participation
+  arrange(desc(medal_per_athlete))
+
+# Analyze career paths by country strength
+career_by_country <- olympic_data_filled %>%
+  group_by(ID) %>%
+  summarise(
+    career_length = max(Year) - min(Year),
+    participations = n_distinct(Games),
+    country = first(NOC),
+    medals_won = sum(Medal != "No Medal"),
+    first_age = first(Age),
+    main_sport = names(which.max(table(Sport)))
+  ) %>%
+  left_join(country_strength, by = c("country" = "NOC")) %>%
+  mutate(
+    country_tier = case_when(
+      medal_per_athlete >= quantile(medal_per_athlete, 0.75, na.rm = TRUE) ~ "Top Tier",
+      medal_per_athlete >= quantile(medal_per_athlete, 0.25, na.rm = TRUE) ~ "Middle Tier",
+      TRUE ~ "Lower Tier"
+    )
+  )
+
+# 1. Country Strength Overview
+p1 <- ggplot(head(country_strength, 20), 
+       aes(x = reorder(NOC, medal_per_athlete), y = medal_per_athlete)) +
+  geom_bar(stat = "identity", aes(fill = medal_success_rate)) +
+  coord_flip() +
+  scale_fill_viridis() +
+  labs(
+    title = "Top 20 Countries by Medal Performance",
+    x = "Country",
+    y = "Medals per Athlete",
+    fill = "Medal Success Rate"
+  ) +
+  theme_minimal()
+
+# 2. Career Length by Country Tier
+p2 <- ggplot(career_by_country, aes(x = country_tier, y = career_length, fill = country_tier)) +
+  geom_boxplot() +
+  labs(
+    title = "Career Length Distribution by Country Tier",
+    x = "Country Tier",
+    y = "Career Length (Years)"
+  ) +
+  theme_minimal()
+
+
+# Display plots
+print(p1)
+print(p2)
+```
+
+# Feature Selection
+
+```{r}
+# Data preparation with merged categories
+model_data <- olympic_data_filled %>%
+  group_by(ID) %>%
+  summarise(
+    first_age = first(Age),
+    total_medals = sum(Medal != "No Medal", na.rm = TRUE),
+    bmi = first(Weight) / ((first(Height)/100)^2),
+    sport = first(Sport),
+    gender = first(Sex),
+    season = first(Season),
+    country_strength = mean(Medal != "No Medal", na.rm = TRUE),
+    
+    # Merge Medium and Long into one category
+    career_category = cut(max(Year) - min(Year),
+                         breaks = c(-Inf, 0, 4, Inf),  # Changed breaks
+                         labels = c("Single", "Short", "Long"))  # Renamed categories
+  ) %>%
+  ungroup() %>%
+  # Handle missing values and convert factors
+  mutate(
+    across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm = TRUE), .)),
+    across(c(gender, sport, season, career_category), factor)
+  ) %>%
+  # Explicitly select columns to ensure ID is dropped
+  select(first_age, bmi, sport, gender, 
+         season, country_strength, total_medals, career_category)
+```
+
+
+# ANOVA & Chi-Square
+
+```{r}
+# 1. ANOVA for Numeric Predictors
+# Test relationship between numeric predictors and career length
+
+# First Age ANOVA
+age_anova <- aov(first_age ~ career_category, data = model_data)
+print("ANOVA Results - First Age:")
+print(summary(age_anova))
+
+# BMI ANOVA
+bmi_anova <- aov(bmi ~ career_category, data = model_data)
+print("\nANOVA Results - BMI:")
+print(summary(bmi_anova))
+
+# Total Medals ANOVA
+medals_anova <- aov(total_medals ~ career_category, data = model_data)
+print("\nANOVA Results - Total Medals:")
+print(summary(medals_anova))
+
+# Country Strength ANOVA
+country_anova <- aov(country_strength ~ career_category, data = model_data)
+print("\nANOVA Results - Country Strength:")
+print(summary(country_anova))
+
+# 2. Chi-Square Tests for Categorical Predictors
+
+# Sport Chi-Square Test
+sport_chi <- chisq.test(table(model_data$sport, model_data$career_category))
+print("\nChi-Square Test Results - Sport:")
+print(sport_chi)
+
+# Gender Chi-Square Test
+gender_chi <- chisq.test(table(model_data$gender, model_data$career_category))
+print("\nChi-Square Test Results - Gender:")
+print(gender_chi)
+
+# Season Chi-Square Test
+season_chi <- chisq.test(table(model_data$season, model_data$career_category))
+print("\nChi-Square Test Results - Season:")
+print(season_chi)
+
+# 3. Post-hoc analysis for significant ANOVA results
+# Using Tukey's HSD test
+print("\nPost-hoc Analysis - First Age:")
+print(TukeyHSD(age_anova))
+
+print("\nPost-hoc Analysis - Total Medals:")
+print(TukeyHSD(medals_anova))
+
+# 4. Effect Size Calculations
+# Eta-squared for ANOVA
+calculate_eta_squared <- function(aov_result) {
+  ss_total <- sum(summary(aov_result)[[1]]$`Sum Sq`)
+  ss_effect <- summary(aov_result)[[1]]$`Sum Sq`[1]
+  eta_squared <- ss_effect/ss_total
+  return(eta_squared)
+}
+
+eta_squared_results <- data.frame(
+  Variable = c("First Age", "BMI", "Total Medals", "Country Strength"),
+  Eta_Squared = c(
+    calculate_eta_squared(age_anova),
+    calculate_eta_squared(bmi_anova),
+    calculate_eta_squared(medals_anova),
+    calculate_eta_squared(country_anova)
+  )
+)
+
+print("\nEffect Sizes (Eta-squared):")
+print(eta_squared_results)
+
+# 5. Visualization of significant relationships
+ggplot(model_data, aes(x = career_category, y = first_age)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "First Age Distribution by Career Category",
+       x = "Career Category",
+       y = "First Age")
+
+ggplot(model_data, aes(x = career_category, y = total_medals)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Total Medals Distribution by Career Category",
+       x = "Career Category",
+       y = "Total Medals")
+```
+
+```{r}
+# 1. Format ANOVA results for visualization
+anova_viz_data <- data.frame(
+  Predictor = c("first_age", "bmi", "total_medals", "country_strength"),
+  F_value = c(1232.92, 204.45, 7428.55, 318.11),
+  Eta_squared = c(0.0186, 0.0031, 0.1023, 0.0049),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(Predictor = factor(Predictor, levels = Predictor[order(Eta_squared, decreasing = TRUE)]))
+
+# Create ANOVA visualization
+p1 <- ggplot(anova_viz_data, aes(x = reorder(Predictor, Eta_squared), y = Eta_squared)) +
+  geom_bar(stat = "identity", fill = "steelblue", width = 0.7) +
+  geom_text(aes(label = sprintf("%.4f", Eta_squared)), 
+            vjust = -0.5, size = 4) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  ) +
+  labs(
+    title = "Effect Sizes (Eta-squared) from ANOVA",
+    x = "Predictor",
+    y = "Eta-squared"
+  )
+
+# 2. Create boxplots for significant numeric predictors
+# Prepare data in long format for faceting
+numeric_data <- model_data %>%
+  select(career_category, first_age, total_medals) %>%
+  gather(key = "variable", value = "value", -career_category)
+
+p2 <- ggplot(numeric_data, aes(x = career_category, y = value, fill = career_category)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free_y", nrow = 1) +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    plot.title = element_text(size = 14, face = "bold"),
+    strip.text = element_text(size = 10)
+  ) +
+  labs(
+    title = "Distribution of Key Numeric Predictors by Career Category",
+    x = "Career Category",
+    y = "Value"
+  )
+
+# 3. Categorical predictors visualization
+# Create mosaic plot data
+gender_prop <- prop.table(table(model_data$career_category, model_data$gender), 2) %>%
+  as.data.frame() %>%
+  setNames(c("Career", "Gender", "Proportion"))
+
+p3 <- ggplot(gender_prop, aes(x = Gender, y = Proportion, fill = Career)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Career Length Distribution by Gender",
+    x = "Gender",
+    y = "Proportion"
+  )
+
+p1
+p2
+p3
+```
+
+# 3. ---- Modelling ----
+
+# Build Model
+
+```{R}
+# Train-Test Split
+set.seed(123)
+train_idx <- createDataPartition(model_data$career_category, p = 0.7, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data <- model_data[-train_idx, ]
+
+# Random Forest
+rf_model <- randomForest(
+  career_category ~ .,
+  data = train_data,
+  ntree = 500,
+  importance = TRUE
+)
+
+# Gradient Boosting
+train_data$career_category_num <- as.numeric(train_data$career_category)
+test_data$career_category_num <- as.numeric(test_data$career_category)
+
+gb_model <- gbm(
+  career_category_num ~ . - career_category,
+  data = train_data,
+  distribution = "gaussian",
+  n.trees = 300,
+  interaction.depth = 4,
+  shrinkage = 0.05,
+  bag.fraction = 0.8,
+  train.fraction = 0.8,
+  verbose = FALSE
+)
+```
+
+
+# Result
+
+```{R}
+# Predictions and Evaluation
+rf_pred <- predict(rf_model, test_data)
+rf_cm <- confusionMatrix(rf_pred, test_data$career_category)
+
+gb_pred_raw <- predict(gb_model, test_data, n.trees = 300)
+gb_pred_class <- cut(gb_pred_raw, 
+                    breaks = c(-Inf, 1.5, 2.5, Inf),
+                    labels = levels(test_data$career_category))
+gb_cm <- confusionMatrix(gb_pred_class, test_data$career_category)
+
+# Print results
+cat("\nRandom Forest Performance:\n")
+print(rf_cm$overall)
+print("\nRandom Forest Confusion Matrix:")
+print(rf_cm$table)
+
+cat("\nGradient Boosting Performance:\n")
+print(gb_cm$overall)
+print("\nGradient Boosting Confusion Matrix:")
+print(gb_cm$table)
+
+# Feature importance plot
+importance_df <- importance(rf_model) %>%
+  as.data.frame() %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(MeanDecreaseGini))
+
+ggplot(importance_df,
+       aes(x = reorder(Feature, MeanDecreaseGini),
+           y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Feature Importance",
+       x = "Features",
+       y = "Importance (Mean Decrease Gini)")
+
+```
+
+
+
+# 4. ---- Clustering ----
+
+# K-means
+
+```{r}
+# Prepare data for clustering
+cluster_data <- olympic_data_filled %>%
+  group_by(ID) %>%
+  summarise(
+    # Athletic career features
+    participations = n_distinct(Games),
+    career_span = max(Year) - min(Year),
+    
+    # Performance metrics
+    medals = sum(Medal != "No Medal"),
+    medal_rate = sum(Medal != "No Medal") / n_distinct(Games),
+    
+    # Physical characteristics
+    avg_age = mean(Age),
+    height = first(Height),
+    weight = first(Weight),
+    bmi = weight / ((height/100)^2),
+    
+    # Sport characteristics
+    main_sport = names(which.max(table(Sport))),
+    gender = first(Sex)
+  ) %>%
+  # Filter out extreme values
+  filter(
+    career_span >= 0,
+    bmi >= 16 & bmi <= 40,
+    avg_age >= 15 & avg_age <= 50,
+    !is.na(medal_rate)
+  )
+
+# Prepare numerical data for clustering
+numeric_vars <- c("participations", "career_span", "medals", 
+                 "medal_rate", "avg_age", "bmi")
+scaled_data <- scale(cluster_data[numeric_vars])
+
+# Find optimal number of clusters using silhouette method
+set.seed(123)
+k <- 6  # Based on your data characteristics
+
+# Perform k-means clustering
+kmeans_result <- kmeans(scaled_data, centers = k, nstart = 25)
+
+# Add cluster assignments to original data
+clustered_athletes <- cluster_data %>%
+  mutate(cluster = factor(kmeans_result$cluster))
+```
+
+# Cluster Analysis
+
+```{R}
+# Create cluster profiles
+cluster_profiles <- clustered_athletes %>%
+  group_by(cluster) %>%
+  summarise(
+    size = n(),
+    avg_participations = mean(participations),
+    avg_career_span = mean(career_span),
+    avg_medals = mean(medals),
+    medal_rate = mean(medal_rate),
+    avg_age = mean(avg_age),
+    avg_bmi = mean(bmi),
+    pct_female = mean(gender == "F") * 100
+  ) %>%
+  mutate(pct_of_total = size / sum(size) * 100)
+
+# Print results
+print("Cluster Profiles:")
+print(cluster_profiles)
+
+# Create cluster descriptions
+cluster_descriptions <- clustered_athletes %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    description = case_when(
+      mean(medal_rate) > 0.5 & mean(career_span) > 8 ~ "Elite Veterans",
+      mean(medal_rate) > 0.3 & mean(career_span) <= 8 ~ "Rising Stars",
+      mean(career_span) > 8 & mean(medal_rate) <= 0.3 ~ "Long-term Competitors",
+      TRUE ~ "One-time Participants"
+    )
+  )
+
+print("\nCluster Descriptions:")
+print(cluster_descriptions)
+```
+
+# PCA Validation
+
+```{R}
+# Visualization 1: PCA plot
+# Perform PCA
+pca_result <- prcomp(scaled_data)
+pca_data <- as.data.frame(pca_result$x[,1:2])
+pca_data$cluster <- factor(kmeans_result$cluster)
+
+# Create PCA plot
+ggplot(pca_data, aes(x = PC1, y = PC2)) +
+  # Add points with custom appearance
+  geom_point(aes(color = cluster), alpha = 0.6) +
+  # Use a clean color palette
+  scale_color_brewer(palette = "Set2", 
+                    name = "Athlete Cluster") +
+  
+  # Add clear labels
+  labs(title = "Olympic Athlete Career Patterns",
+       x = "PC1 (40.2% explained variance)",
+       y = "PC2 (25.2% explained variance)") +
+  
+  # Apply minimal theme with custom adjustments
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+```
